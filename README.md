@@ -95,7 +95,7 @@ webspider [--http|--https]
 
 ### Modes (choose one; default is --video)
 - `--video` : video files only  
-  `mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts`
+  `mp4|mkv|avi|mov|wmv|flv|webm|m4v|ogv|ts|m2ts`
 - `--audio` : audio files only  
   `mp3|mpa|mp2|aac|wav|flac|m4a|ogg|opus|wma|alac|aif|aiff`
 - `--images` : image files only  
