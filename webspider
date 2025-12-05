@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
-# Spider start URLs/domains/IPs and produce a unique URL list.
+# -----------------------------------------------------------------------------
+#  webspider — Spider start URLs/domains/IPs and produce a unique URL list
 #
-# !!! This script requires the program wget !!!
-# $ sudo apt install wget
+#  WHAT IT DOES (high-level):
+#   1) Accepts seeds (full URLs OR scheme-less hostnames/IPs OR a file of seeds)
+#   2) Normalizes them (adds scheme, brackets IPv6, adds trailing "/" to dirs)
+#   3) Builds a same-site allowlist for wget (so it won’t wander off-site)
+#   4) Runs `wget --spider` recursively to discover links (polite by default)
+#   5) Parses the wget log, de-duplicates, and filters by mode (video/audio/…)
+#   6) Optional sitemaps: sitemap.txt and/or sitemap.xml from the final set
 #
+#  REQUIREMENTS:
+#   - Bash 4+ (arrays and `set -euo pipefail`)
+#   - GNU userland: wget, awk, sed, grep, sort, mktemp, paste
+#     • Written to be compatible with Debian’s default `mawk`.
 #
-# SPDX-License-Identifier: CC0-1.0
-# NO WARRANTY: This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# express or implied, including but not limited to the warranties of
-# merchantability, fitness for a particular purpose and noninfringement.
-# In no event shall the authors be liable for any claim, damages or other
-# liability, whether in an action of contract, tort or otherwise, arising from,
-# out of or in connection with the software or the use or other dealings in the software.
-#
-#
+#  LICENSE & WARRANTY:
+#   SPDX-License-Identifier: CC0-1.0
+#   NO WARRANTY: This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # Usage:
 #   webspider [--http|--https]
 #             [--video|--audio|--images|--pages|--files|--all]
-#             [--ext 'pat|tern'] [--delay SECONDS] [--status-200]
+#             [--ext 'pat|tern']
+#             [--delay SECONDS] [--level N|inf] [--status-200]
 #             [--no-robots]
 #             [--sitemap-txt] [--sitemap-xml]
 #             <links.txt | URL...>
@@ -32,44 +40,58 @@
 #
 # Options:
 #   --ext PAT       : override extension pattern used by --video/--audio/--images/--pages
-#   --delay S       : polite crawl delay in seconds (default: 0.5). Accepts decimals. Uses wget --wait + --random-wait.
-#   --status-200    : only keep URLs that returned HTTP 200 OK (adds -S to wget and parses statuses)
+#   --delay S       : polite crawl delay in seconds (default: 0.5). Always sets --wait=S;
+#                     adds --random-wait only when S > 0 (no jitter if S == 0).
+#   --level N|inf   : recursion depth for wget (default: inf). N is an integer (0+=).
+#   --status-200    : keep URLs that returned HTTP 200 OK (adds -S to wget and parses statuses)
 #   --no-robots     : ignore robots.txt (default: respect robots)
-#   --sitemap-txt   : write sitemap.txt (plain newline-separated list of final URLs)
+#   --sitemap-txt   : write sitemap.txt (newline-separated list from final URLs)
 #   --sitemap-xml   : write sitemap.xml (Sitemaps.org XML from final URLs)
 #   --http|--https  : default scheme for scheme-less inputs (default: https)
 #   -h, --help      : show this help
 #
 # Notes:
-#   Single-dash forms work too: -video, -audio, -images, -pages, -files, -all, -ext, -delay, -status-200, -no-robots, -sitemap-txt, -sitemap-xml
-#   Use -- to end options if a path starts with a dash.
+#   - Single-dash forms also work: -video, -audio, -images, -pages, -files, -all, -ext, -delay, -level, -status-200, -no-robots, -sitemap-txt, -sitemap-xml
+#   - The spider stays within the seed hosts (and their www. variants). To include more
+#     hosts, list them as additional seeds (or via a file).
+#   - Use `--` to end options if a path starts with a dash.
+#
+# Examples:
+#   webspider https://www.example.com/
+#   webspider --images --delay 1.0 --level 2 example.com/images/
+#   webspider --http --status-200 --sitemap-txt --level 1 192.168.1.50:8080 urls.txt
+# -----------------------------------------------------------------------------
 
 set -Eeuo pipefail
 trap 'echo "[ERROR] $0:$LINENO: $BASH_COMMAND" >&2' ERR
 
 PROG="${0##*/}"
 
-DEFAULT_SCHEME="https"
-MODE="video"          # video | audio | images | pages | files | all
-EXT_PATTERN=""        # set from MODE unless overridden by --ext
-DELAY="0.5"
-STATUS_200=0
-NO_ROBOTS=0
-SITEMAP_TXT=0
-SITEMAP_XML=0
-LOG_FILE="log"
-OUTPUT_URLS="urls"
+# ---------------------------- Default settings -------------------------------
+DEFAULT_SCHEME="https"  # default for scheme-less seeds; can be overridden by --http
+MODE="video"            # one of: video|audio|images|pages|files|all
+EXT_PATTERN=""          # set automatically per MODE unless user passes --ext
+DELAY="0.5"             # polite pacing for wget --wait
+LEVEL="inf"             # recursion depth for wget --level
+STATUS_200=0            # if 1, keep only URLs with HTTP 200 OK
+NO_ROBOTS=0             # if 1, ignore robots.txt; else respect robots
+SITEMAP_TXT=0           # write sitemap.txt from final URLs
+SITEMAP_XML=0           # write sitemap.xml from final URLs
+LOG_FILE="log"          # wget’s log goes here; overwritten each run
+OUTPUT_URLS="urls"      # final filtered URL list (deduped)
 
+# ----------------------------- Usage function --------------------------------
 usage() {
   cat <<EOF
 
 !!! This script requires the program wget !!!
- $ sudo apt install wget
+    sudo apt install wget
 
 Usage:
   $PROG [--http|--https]
         [--video|--audio|--images|--pages|--files|--all]
-        [--ext 'pat|tern'] [--delay SECONDS] [--status-200]
+        [--ext 'pat|tern']
+        [--delay SECONDS] [--level N|inf] [--status-200]
         [--no-robots]
         [--sitemap-txt] [--sitemap-xml]
         <links.txt | URL...>
@@ -84,7 +106,9 @@ Modes (default: --video):
 
 Options:
   --ext PAT       : override extension pattern used by --video/--audio/--images/--pages
-  --delay S       : polite crawl delay in seconds (default: 0.5)
+  --delay S       : polite crawl delay in seconds (default: 0.5). Always sets --wait=S; adds
+                    --random-wait only when S > 0 (no jitter if S == 0).
+  --level N|inf   : recursion depth (wget --level), default: inf
   --status-200    : only keep URLs that returned HTTP 200 OK
   --no-robots     : ignore robots.txt (default is to respect robots)
   --sitemap-txt   : write sitemap.txt from the final URL list
@@ -94,19 +118,20 @@ Options:
 
 Examples:
   $PROG https://www.example.com/
-  $PROG --images --delay 1.0 example.com/images/
-  $PROG --http --status-200 --sitemap-txt 192.168.1.50:8080 /path/to/url-list.txt
-     It can do multiple URLs on the command line plus URLs from a file
+  $PROG --images --delay 1.0 --level 2 example.com/images/
+  $PROG --http --status-200 --sitemap-txt --level 1 192.168.1.50:8080 url-list.txt
+     (You can mix literal URLs and a file of URLs.)
 EOF
 }
 
-# --- Args ---
-INPUTS=()
+# ------------------------------ CLI parsing ----------------------------------
+INPUTS=()  # seeds (files or literal seeds)
+
 while [[ $# -gt 0 ]]; do
   arg="$1"
   case "$arg" in
     -h|--help) usage; exit 0 ;;
-    -http|--http) DEFAULT_SCHEME="http"; shift ;;
+    -http|--http)   DEFAULT_SCHEME="http"; shift ;;
     -https|--https) DEFAULT_SCHEME="https"; shift ;;
     -video|--video) MODE="video"; shift ;;
     -audio|--audio) MODE="audio"; shift ;;
@@ -121,6 +146,16 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "[!] --delay requires a value, e.g. --delay 0.9"; exit 2; }
       DELAY="$2"
       [[ "$DELAY" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "[!] --delay must be a number, got: $DELAY"; exit 2; }
+      shift 2 ;;
+    -level|--level)
+      [[ $# -ge 2 ]] || { echo "[!] --level requires a value: integer or 'inf'"; exit 2; }
+      _lvl_raw="$2"; _lvl_lc="${_lvl_raw,,}"
+      if [[ "$_lvl_lc" == "inf" ]]; then
+        LEVEL="inf"
+      else
+        [[ "$_lvl_raw" =~ ^[0-9]+$ ]] || { echo "[!] --level must be an integer or 'inf', got: $_lvl_raw"; exit 2; }
+        LEVEL="$_lvl_raw"
+      fi
       shift 2 ;;
     -status-200|--status-200) STATUS_200=1; shift ;;
     -no-robots|--no-robots)   NO_ROBOTS=1;  shift ;;
@@ -138,25 +173,25 @@ if [[ ${#INPUTS[@]} -eq 0 ]]; then
   usage; exit 1
 fi
 
-# Defaults per mode (unless --ext provided)
+# ------------------------ Mode presets (extensions) --------------------------
 if [[ -z "$EXT_PATTERN" ]]; then
   case "$MODE" in
     video)  EXT_PATTERN='mp4|mkv|avi|mov|wmv|flv|webm|m4v|ogv|ts|m2ts' ;;
     audio)  EXT_PATTERN='mp3|mpa|mp2|aac|wav|flac|m4a|ogg|opus|wma|alac|aif|aiff' ;;
     images) EXT_PATTERN='jpg|jpeg|png|gif|webp|bmp|tiff|svg|avif|heic|heif' ;;
     pages)  EXT_PATTERN='html|htm|shtml|xhtml|php|phtml|asp|aspx|jsp|jspx|cfm|cgi|pl|do|action|md|markdown' ;;
-    *)      EXT_PATTERN='' ;;  # files/all ignore unless user gave --ext
+    *)      EXT_PATTERN='' ;;
   esac
 fi
 
-# --- Temp & cleanup ---
+# ---------------------- Temp files and auto-cleanup --------------------------
 TMP_INPUT="$(mktemp)"
 TMP_URLS="$(mktemp)"
 TMP_FIX="$(mktemp)"
 cleanup() { rm -f "${TMP_INPUT}" "${TMP_URLS}" "${TMP_FIX}"; }
 trap cleanup EXIT
 
-# --- Collate inputs (files and/or literal URLs) ---
+# -------------------------- Collate the inputs -------------------------------
 for src in "${INPUTS[@]}"; do
   if [[ -f "$src" ]]; then
     cat -- "$src" >> "${TMP_INPUT}"
@@ -165,44 +200,44 @@ for src in "${INPUTS[@]}"; do
   fi
 done
 
-# --- Start fresh ---
+# ------------------- Prepare log/output, announce settings -------------------
 : > "${LOG_FILE}"
 : > "${OUTPUT_URLS}"
 
-echo "[*] Normalizing start URLs (scheme: ${DEFAULT_SCHEME}; mode: ${MODE}; delay: ${DELAY}s; status-200: ${STATUS_200}; robots: $([[ $NO_ROBOTS -eq 1 ]] && echo off || echo on))"
+echo "[*] Normalizing start URLs (scheme: ${DEFAULT_SCHEME}; mode: ${MODE}; delay: ${DELAY}s; level: ${LEVEL}; status-200: ${STATUS_200}; robots: $([[ $NO_ROBOTS -eq 1 ]] && echo off || echo on))"
+
 SCHEME_PREFIX="${DEFAULT_SCHEME}://"
 
-# A) Already-formed URLs
+# ------------------- Normalize the seed list into full URLs ------------------
 grep -Eo 'https?://[^[:space:]#]+' "${TMP_INPUT}" >> "${TMP_URLS}" || true
 
-# B) Scheme-less -> add scheme (hostnames, IPv4, [IPv6], bare IPv6)
 { grep -Ev '^\s*(#|$)' "${TMP_INPUT}" \
   | grep -Ev '^\s*https?://' \
   | sed -E 's/\r$//' \
   | sed -E 's/^\s+|\s+$//g' \
   | awk -v P="$SCHEME_PREFIX" '
-      /^\[[0-9A-Fa-f:]+\](:[0-9]+)?(\/.*)?$/     { print P $0; next }  # [IPv6]
+      /^\[[0-9A-Fa-f:]+\](:[0-9]+)?(\/.*)?$/ { print P $0; next }
       /^[0-9A-Fa-f:]+(\/.*)?$/ {
-          match($0, /^([0-9A-Fa-f:]+)(\/.*)?$/, m)                     # bare IPv6
-          host=m[1]; path=(m[2]?m[2]:""); print P "[" host "]" path; next
+          s=$0
+          slash=index(s,"/")
+          if (slash>0) { host=substr(s,1,slash-1); path=substr(s,slash) }
+          else         { host=s; path="" }
+          print P "[" host "]" path; next
       }
-      NF { print P $0 }                                                # host/IPv4
+      NF { print P $0 }
     ' >> "${TMP_URLS}"; } || true
 
-# Add trailing slash to hosts and directory-like paths (no last-segment dot, no ? or #)
 awk '
   {
     u=$0
     if (u ~ /[?#]/) { print u; next }
     if (u ~ /\/$/) { print u; next }
     if (u ~ "^https?://[^/]+$") { print u"/"; next }
-    n=split(u,a,"/")
-    last=a[n]
+    n=split(u,a,"/"); last=a[n]
     if (index(last,".")==0) print u"/"; else print u
   }
 ' "${TMP_URLS}" > "${TMP_FIX}" && mv "${TMP_FIX}" "${TMP_URLS}"
 
-# De-dup normalized start URLs
 sort -u -o "${TMP_URLS}" "${TMP_URLS}"
 
 if [[ ! -s "${TMP_URLS}" ]]; then
@@ -210,7 +245,7 @@ if [[ ! -s "${TMP_URLS}" ]]; then
   exit 2
 fi
 
-# --- Allowlist for wget (skip for IPv6 literal) ---
+# --------------------- Build a same-site allowlist for wget ------------------
 HOSTS="$(
   awk -F/ '/^https?:\/\//{print $3}' "${TMP_URLS}" \
   | sed -E 's/^\[([0-9A-Fa-f:]+)\](:[0-9]+)?$/\1/' \
@@ -218,16 +253,33 @@ HOSTS="$(
   | awk '{print tolower($0)}' \
   | sort -u
 )"
-HOSTS="$(echo "${HOSTS}" | awk '/^[a-z0-9-]+\.[a-z0-9-]+$/ {print; print "www."$0; next} {print}' | sort -u)"
+HOSTS="$(echo "${HOSTS}" \
+  | awk '/^[a-z0-9-]+\.[a-z0-9-]+$/ {print; print "www."$0; next} {print}' \
+  | sort -u)"
 
 USE_DOMAINS=1
 if echo "${HOSTS}" | grep -q ':'; then USE_DOMAINS=0; fi
 
-# --- Build wget command as an array ---
-WGET_CMD=( wget --spider --recursive --no-parent --level=inf
- --no-directories --no-host-directories
- --wait="${DELAY}" --random-wait
- --no-verbose --output-file="${LOG_FILE}" )
+# -------------------------- Assemble the wget call ---------------------------
+WGET_CMD=(
+  wget
+  --spider
+  --recursive
+  --no-parent
+  --level="${LEVEL}"
+  --no-directories
+  --no-host-directories
+  --no-verbose
+  --output-file="${LOG_FILE}"
+)
+
+# Always set the base wait
+WGET_CMD+=( --wait="${DELAY}" )
+# Jitter only when delay > 0
+case "$DELAY" in
+  0|0.*) : ;;
+  * )    WGET_CMD+=( --random-wait ) ;;
+esac
 
 # Respect robots by default; optionally ignore
 if [[ "${NO_ROBOTS}" -eq 1 ]]; then
@@ -252,16 +304,14 @@ echo "[*] Starting spider..."
 [[ ${USE_DOMAINS} -eq 1 ]] && echo "[*] Domains allowlist: $(echo "${HOSTS}" | paste -sd, -)"
 echo "[*] Logging to: ${LOG_FILE}"
 
-# Show the exact wget command (nice for debugging)
+# Show the exact wget command (copy-pastable)
 { echo "[*] Wget command:"; printf ' %q' "${WGET_CMD[@]}"; echo; } | tee -a "${LOG_FILE}"
 
-# Run wget
-# With `set -e`, wrap the command in an `if ! ...; then` test so the shell doesn’t exit.
+# Run wget; accept 0 (ok) and 8 (broken links found/server errors), fail otherwise
 if ! "${WGET_CMD[@]}"; then
   rc=$?
   case "$rc" in
-    0)
-      : ;;  # success
+    0) : ;;
     8)
       echo "[!] wget exit 8: server error(s) encountered (e.g., 404/5xx)."
       echo "    This usually just means broken links were found; continuing."
@@ -284,15 +334,17 @@ fi
 echo "[*] Extracting URLs from log..."
 
 if [[ "${STATUS_200}" -eq 1 ]]; then
-  # Keep only URLs that received HTTP 200 OK (handles same-line and next-line 200)
+  # mawk-safe AWK: capture URL token after "URL:" and require same- or next-line 200
   awk '
     /URL:[[:space:]]*https?:\/\// {
-      match($0, /URL:[[:space:]]*(https?:\/\/[^ ]+)/, m)
-      u=m[1]; last=u
-      if ($0 ~ /[[:space:]]200[[:space:]]+OK/) { print last; last="" }
+      u=$0
+      sub(/^.*URL:[[:space:]]*/,"",u)
+      sub(/[[:space:]].*$/,"",u)
+      last=u
+      if ($0 ~ /HTTP\/[0-9.]+[[:space:]]+200([[:space:]]|$)/) { print last; last="" }
       next
     }
-    /HTTP\/[0-9.]+[[:space:]]+200/ && last { print last; last="" }
+    /HTTP\/[0-9.]+[[:space:]]+200([[:space:]]|$)/ && last { print last; last="" }
   ' "${LOG_FILE}" \
   | sed -E 's/[?#].*$//' \
   | sed -E 's#/(index\.html?)$#/#' \
@@ -304,7 +356,7 @@ else
   | sort -u > "${OUTPUT_URLS}"
 fi
 
-# --- Output filters ---
+# ------------------------- Filter by the selected mode -----------------------
 case "${MODE}" in
   video|audio|images)
     mv "${OUTPUT_URLS}" "${OUTPUT_URLS}.all"
@@ -318,7 +370,6 @@ case "${MODE}" in
     ;;
   pages)
     mv "${OUTPUT_URLS}" "${OUTPUT_URLS}.all"
-    # Keep directories OR page-like extensions
     awk -v IGNORECASE=1 -v PATS="${EXT_PATTERN}" '
       /\/$/ { print; next }
       $0 ~ "\\.(" PATS ")$" { print }
@@ -328,7 +379,6 @@ case "${MODE}" in
     ;;
   files)
     mv "${OUTPUT_URLS}" "${OUTPUT_URLS}.all"
-    # All files = exclude directories and .html/.htm
     grep -Ev '(/$|\.html?$)' "${OUTPUT_URLS}.all" > "${OUTPUT_URLS}" || true
     rm -f "${OUTPUT_URLS}.all"
     echo "[*] Mode: all files (no dirs/pages)."
@@ -338,14 +388,13 @@ case "${MODE}" in
     ;;
 esac
 
-# --- Optional sitemaps ---
+# ------------------------------ Sitemaps output ------------------------------
 if [[ "${SITEMAP_TXT}" -eq 1 ]]; then
   cp "${OUTPUT_URLS}" sitemap.txt
   echo "[*] Wrote sitemap.txt"
 fi
 
 if [[ "${SITEMAP_XML}" -eq 1 ]]; then
-  # Escape &, <, > for XML safety (queries/fragments already removed)
   esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
   {
     echo '<?xml version="1.0" encoding="UTF-8"?>'
